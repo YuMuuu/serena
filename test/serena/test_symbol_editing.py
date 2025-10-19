@@ -1,9 +1,15 @@
+"""
+Snapshot tests using the (awesome) syrupy pytest plugin https://github.com/syrupy-project/syrupy.
+Recreate the snapshots with `pytest --snapshot-update`.
+"""
+
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -12,6 +18,8 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 import pytest
+from overrides import overrides
+from syrupy import SnapshotAssertion
 
 from serena.code_editor import CodeEditor, LanguageServerCodeEditor
 from solidlsp.ls_config import Language
@@ -168,7 +176,7 @@ class CodeDiff:
         return "".join(diff)
 
 
-class EditingTest:
+class EditingTest(ABC):
     def __init__(self, language: Language, rel_path: str):
         """
         :param language: the language
@@ -220,7 +228,7 @@ class EditingTest:
         with open(file_path, encoding="utf-8") as f:
             return f.read()
 
-    def run_test(self, content_after_ground_truth: str) -> None:
+    def run_test(self, content_after_ground_truth: str | SnapshotAssertion) -> None:
         with self._setup() as symbol_retriever:
             content_before = self._read_file(self.rel_path)
             code_editor = LanguageServerCodeEditor(symbol_retriever)
@@ -233,7 +241,8 @@ class EditingTest:
     def _apply_edit(self, code_editor: CodeEditor) -> None:
         pass
 
-    def _test_diff(self, code_diff: CodeDiff, snapshot: str) -> None:
+    def _test_diff(self, code_diff: CodeDiff, snapshot: SnapshotAssertion) -> None:
+        assert code_diff.has_changes, f"Sanity check failed: No changes detected in {code_diff.relative_path}"
         assert code_diff.modified_content == snapshot
 
 
@@ -275,7 +284,7 @@ class DeleteSymbolTest(EditingTest):
         ),
     ],
 )
-def test_delete_symbol(test_case, snapshot):
+def test_delete_symbol(test_case, snapshot: SnapshotAssertion):
     test_case.run_test(content_after_ground_truth=snapshot)
 
 
@@ -368,13 +377,13 @@ class InsertInRelToSymbolTest(EditingTest):
         ),
     ],
 )
-def test_insert_in_rel_to_symbol(test_case: InsertInRelToSymbolTest, mode: Literal["before", "after"], snapshot):
+def test_insert_in_rel_to_symbol(test_case: InsertInRelToSymbolTest, mode: Literal["before", "after"], snapshot: SnapshotAssertion):
     test_case.set_mode(mode)
     test_case.run_test(content_after_ground_truth=snapshot)
 
 
 @pytest.mark.python
-def test_insert_python_class_before(snapshot):
+def test_insert_python_class_before(snapshot: SnapshotAssertion):
     InsertInRelToSymbolTest(
         Language.PYTHON,
         PYTHON_TEST_REL_FILE_PATH,
@@ -385,7 +394,7 @@ def test_insert_python_class_before(snapshot):
 
 
 @pytest.mark.python
-def test_insert_python_class_after(snapshot):
+def test_insert_python_class_after(snapshot: SnapshotAssertion):
     InsertInRelToSymbolTest(
         Language.PYTHON,
         PYTHON_TEST_REL_FILE_PATH,
@@ -441,5 +450,72 @@ class ReplaceBodyTest(EditingTest):
         ),
     ],
 )
-def test_replace_body(test_case: ReplaceBodyTest, snapshot):
+def test_replace_body(test_case: ReplaceBodyTest, snapshot: SnapshotAssertion):
+    # assert "a" in snapshot
+    test_case.run_test(content_after_ground_truth=snapshot)
+
+
+NIX_ATTR_REPLACEMENT = """c = 3;"""
+
+
+class NixAttrReplacementTest(EditingTest):
+    """Test for replacing individual attributes in Nix that should NOT result in double semicolons."""
+
+    def __init__(self, language: Language, rel_path: str, symbol_name: str, new_body: str):
+        super().__init__(language, rel_path)
+        self.symbol_name = symbol_name
+        self.new_body = new_body
+
+    def _apply_edit(self, code_editor: CodeEditor) -> None:
+        code_editor.replace_body(self.symbol_name, self.rel_path, self.new_body)
+
+
+@pytest.mark.nix
+@pytest.mark.skipif(sys.platform == "win32", reason="nixd language server doesn't run on Windows")
+def test_nix_symbol_replacement_no_double_semicolon(snapshot: SnapshotAssertion):
+    """
+    Test that replacing a Nix attribute does not result in double semicolons.
+
+    This test exercises the bug where:
+    - Original: users.users.example = { isSystemUser = true; group = "example"; description = "Example service user"; };
+    - Replacement: c = 3;
+    - Bug result would be: c = 3;; (double semicolon)
+    - Correct result should be: c = 3; (single semicolon)
+
+    The replacement body includes a semicolon, but the language server's range extension
+    logic should prevent double semicolons.
+    """
+    test_case = NixAttrReplacementTest(
+        Language.NIX,
+        "default.nix",
+        "testUser",  # Simple attrset with multiple key-value pairs
+        NIX_ATTR_REPLACEMENT,
+    )
+    test_case.run_test(content_after_ground_truth=snapshot)
+
+
+class RenameSymbolTest(EditingTest):
+    def __init__(self, language: Language, rel_path: str, symbol_name: str, new_name: str):
+        super().__init__(language, rel_path)
+        self.symbol_name = symbol_name
+        self.new_name = new_name
+
+    def _apply_edit(self, code_editor: CodeEditor) -> None:
+        code_editor.rename_symbol(self.symbol_name, self.rel_path, self.new_name)
+
+    @overrides
+    def _test_diff(self, code_diff: CodeDiff, snapshot: SnapshotAssertion) -> None:
+        # sanity check (e.g., for newly generated snapshots) that the new name is actually in the modified content
+        assert self.new_name in code_diff.modified_content, f"New name '{self.new_name}' not found in modified content."
+        return super()._test_diff(code_diff, snapshot)
+
+
+@pytest.mark.python
+def test_rename_symbol(snapshot: SnapshotAssertion):
+    test_case = RenameSymbolTest(
+        Language.PYTHON,
+        PYTHON_TEST_REL_FILE_PATH,
+        "typed_module_var",
+        "renamed_typed_module_var",
+    )
     test_case.run_test(content_after_ground_truth=snapshot)

@@ -1,11 +1,13 @@
+import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 import pathspec
 
-from serena.config.serena_config import DEFAULT_TOOL_TIMEOUT, ProjectConfig
-from serena.constants import SERENA_MANAGED_DIR_IN_HOME
+from serena.config.serena_config import DEFAULT_TOOL_TIMEOUT, ProjectConfig, get_serena_managed_in_project_dir
+from serena.constants import SERENA_FILE_ENCODING, SERENA_MANAGED_DIR_IN_HOME, SERENA_MANAGED_DIR_NAME
 from serena.text_utils import MatchedConsecutiveLines, search_files
 from serena.util.file_system import GitignoreParser, match_path
 from solidlsp import SolidLanguageServer
@@ -16,11 +18,54 @@ from solidlsp.settings import SolidLSPSettings
 log = logging.getLogger(__name__)
 
 
+class MemoriesManager:
+    def __init__(self, project_root: str):
+        self._memory_dir = Path(get_serena_managed_in_project_dir(project_root)) / "memories"
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
+        self._encoding = SERENA_FILE_ENCODING
+
+    def _get_memory_file_path(self, name: str) -> Path:
+        # strip all .md from the name. Models tend to get confused, sometimes passing the .md extension and sometimes not.
+        name = name.replace(".md", "")
+        filename = f"{name}.md"
+        return self._memory_dir / filename
+
+    def load_memory(self, name: str) -> str:
+        memory_file_path = self._get_memory_file_path(name)
+        if not memory_file_path.exists():
+            return f"Memory file {name} not found, consider creating it with the `write_memory` tool if you need it."
+        with open(memory_file_path, encoding=self._encoding) as f:
+            return f.read()
+
+    def save_memory(self, name: str, content: str) -> str:
+        memory_file_path = self._get_memory_file_path(name)
+        with open(memory_file_path, "w", encoding=self._encoding) as f:
+            f.write(content)
+        return f"Memory {name} written."
+
+    def list_memories(self) -> list[str]:
+        return [f.name.replace(".md", "") for f in self._memory_dir.iterdir() if f.is_file()]
+
+    def delete_memory(self, name: str) -> str:
+        memory_file_path = self._get_memory_file_path(name)
+        memory_file_path.unlink()
+        return f"Memory {name} deleted."
+
+
 class Project:
     def __init__(self, project_root: str, project_config: ProjectConfig, is_newly_created: bool = False):
         self.project_root = project_root
         self.project_config = project_config
-        self.is_newly_created = is_newly_created
+        self.memories_manager = MemoriesManager(project_root)
+        self._is_newly_created = is_newly_created
+
+        # create .gitignore file in the project's Serena data folder if not yet present
+        serena_data_gitignore_path = os.path.join(self.path_to_serena_data_folder(), ".gitignore")
+        if not os.path.exists(serena_data_gitignore_path):
+            os.makedirs(os.path.dirname(serena_data_gitignore_path), exist_ok=True)
+            log.info(f"Creating .gitignore file in {serena_data_gitignore_path}")
+            with open(serena_data_gitignore_path, "w", encoding="utf-8") as f:
+                f.write(f"/{SolidLanguageServer.CACHE_FOLDER_NAME}\n")
 
         # gather ignored paths from the project configuration and gitignore files
         ignored_patterns = project_config.ignored_paths
@@ -28,9 +73,7 @@ class Project:
             log.info(f"Using {len(ignored_patterns)} ignored paths from the explicit project configuration.")
             log.debug(f"Ignored paths: {ignored_patterns}")
         if project_config.ignore_all_files_in_gitignore:
-            log.info(f"Parsing all gitignore files in {self.project_root}")
             gitignore_parser = GitignoreParser(self.project_root)
-            log.info(f"Found {len(gitignore_parser.get_ignore_specs())} gitignore files.")
             for spec in gitignore_parser.get_ignore_specs():
                 log.debug(f"Adding {len(spec.patterns)} patterns from {spec.file_path} to the ignored paths.")
                 ignored_patterns.extend(spec.patterns)
@@ -62,8 +105,30 @@ class Project:
         project_config = ProjectConfig.load(project_root, autogenerate=autogenerate)
         return Project(project_root=str(project_root), project_config=project_config)
 
+    def path_to_serena_data_folder(self) -> str:
+        return os.path.join(self.project_root, SERENA_MANAGED_DIR_NAME)
+
     def path_to_project_yml(self) -> str:
         return os.path.join(self.project_root, self.project_config.rel_path_to_project_yml())
+
+    def get_activation_message(self) -> str:
+        """
+        :return: a message providing information about the project upon activation (e.g. programming language, memories, initial prompt)
+        """
+        if self._is_newly_created:
+            msg = f"Created and activated a new project with name '{self.project_name}' at {self.project_root}. "
+        else:
+            msg = f"The project with name '{self.project_name}' at {self.project_root} is activated."
+        msg += f"\nProgramming language: {self.project_config.language.value}; file encoding: {self.project_config.encoding}"
+        memories = self.memories_manager.list_memories()
+        if memories:
+            msg += (
+                f"\nAvailable project memories: {json.dumps(memories)}\n"
+                + "Use the `read_memory` tool to read these memories later if they are relevant to the task."
+            )
+        if self.project_config.initial_prompt:
+            msg += f"\nAdditional project-specific instructions:\n {self.project_config.initial_prompt}"
+        return msg
 
     def read_file(self, relative_path: str) -> str:
         """
@@ -84,9 +149,6 @@ class Project:
         """
         return self._ignore_spec
 
-    def _is_ignored_dirname(self, dirname: str) -> bool:
-        return dirname.startswith(".")
-
     def _is_ignored_relative_path(self, relative_path: str | Path, ignore_non_source_files: bool = True) -> bool:
         """
         Determine whether an existing path should be ignored based on file type and ignore patterns.
@@ -98,6 +160,12 @@ class Project:
 
         :return: whether the path should be ignored
         """
+        # special case, never ignore the project root itself
+        # If the user ignores hidden files, "." might match against the corresponding PathSpec pattern.
+        # The empty string also points to the project root and should never be ignored.
+        if str(relative_path) in [".", ""]:
+            return False
+
         abs_path = os.path.join(self.project_root, relative_path)
         if not os.path.exists(abs_path):
             raise FileNotFoundError(f"File {abs_path} not found, the ignore check cannot be performed")
@@ -116,16 +184,6 @@ class Project:
         if len(rel_path.parts) > 0 and rel_path.parts[0] == ".git":
             return True
 
-        # Check each part of the path against always fulfilled ignore conditions
-        dir_parts = rel_path.parts
-        if is_file:
-            dir_parts = dir_parts[:-1]
-        for part in dir_parts:
-            if not part:  # Skip empty parts (e.g., from leading '/')
-                continue
-            if self._is_ignored_dirname(part):
-                return True
-
         return match_path(str(relative_path), self.get_ignore_spec(), root_path=self.project_root)
 
     def is_ignored_path(self, path: str | Path, ignore_non_source_files: bool = False) -> bool:
@@ -138,7 +196,13 @@ class Project:
         """
         path = Path(path)
         if path.is_absolute():
-            relative_path = path.relative_to(self.project_root)
+            try:
+                relative_path = path.relative_to(self.project_root)
+            except ValueError:
+                # If the path is not relative to the project root, we consider it as an absolute path outside the project
+                # (which we ignore)
+                log.warning(f"Path {path} is not relative to the project root {self.project_root} and was therefore ignored")
+                return True
         else:
             relative_path = path
 
@@ -167,18 +231,22 @@ class Project:
         abs_path = Path(self.project_root) / relative_path
         return abs_path.exists()
 
-    def validate_relative_path(self, relative_path: str) -> None:
+    def validate_relative_path(self, relative_path: str, require_not_ignored: bool = False) -> None:
         """
         Validates that the given relative path to an existing file/dir is safe to read or edit,
-        meaning it's inside the project directory and is not ignored by git.
+        meaning it's inside the project directory.
 
         Passing a path to a non-existing file will lead to a `FileNotFoundError`.
+
+        :param relative_path: the path to validate, relative to the project root
+        :param require_not_ignored: if True, the path must not be ignored according to the project's ignore settings
         """
         if not self.is_path_in_project(relative_path):
             raise ValueError(f"{relative_path=} points to path outside of the repository root; cannot access for safety reasons")
 
-        if self.is_ignored_path(relative_path):
-            raise ValueError(f"Path {relative_path} is ignored; cannot access for safety reasons")
+        if require_not_ignored:
+            if self.is_ignored_path(relative_path):
+                raise ValueError(f"Path {relative_path} is ignored; cannot access for safety reasons")
 
     def gather_source_files(self, relative_path: str = "") -> list[str]:
         """Retrieves relative paths of all source files, optionally limited to the given path
@@ -193,15 +261,27 @@ class Project:
             return [relative_path]
         else:
             for root, dirs, files in os.walk(start_path, followlinks=True):
-                dirs[:] = [d for d in dirs if not self._is_ignored_relative_path(os.path.join(root, d))]
+                # prevent recursion into ignored directories
+                dirs[:] = [d for d in dirs if not self.is_ignored_path(os.path.join(root, d))]
+
+                # collect non-ignored files
                 for file in files:
-                    rel_file_path = os.path.relpath(os.path.join(root, file), start=self.project_root)
+                    abs_file_path = os.path.join(root, file)
                     try:
-                        if not self._is_ignored_relative_path(rel_file_path):
+                        if not self.is_ignored_path(abs_file_path, ignore_non_source_files=True):
+                            try:
+                                rel_file_path = os.path.relpath(abs_file_path, start=self.project_root)
+                            except Exception:
+                                log.warning(
+                                    "Ignoring path '%s' because it appears to be outside of the project root (%s)",
+                                    abs_file_path,
+                                    self.project_root,
+                                )
+                                continue
                             rel_file_paths.append(rel_file_path)
                     except FileNotFoundError:
                         log.warning(
-                            f"File {rel_file_path} not found (possibly due it being a symlink), skipping it in request_parsed_files",
+                            f"File {abs_file_path} not found (possibly due it being a symlink), skipping it in request_parsed_files",
                         )
             return rel_file_paths
 
@@ -230,6 +310,7 @@ class Project:
             relative_file_paths,
             pattern,
             root_path=self.project_root,
+            file_reader=self.read_file,
             context_lines_before=context_lines_before,
             context_lines_after=context_lines_after,
             paths_include_glob=paths_include_glob,
@@ -263,6 +344,7 @@ class Project:
         log_level: int = logging.INFO,
         ls_timeout: float | None = DEFAULT_TOOL_TIMEOUT - 5,
         trace_lsp_communication: bool = False,
+        ls_specific_settings: dict[Language, Any] | None = None,
     ) -> SolidLanguageServer:
         """
         Create a language server for a project. Note that you will have to start it
@@ -273,12 +355,15 @@ class Project:
         :param log_level: the log level for the language server
         :param ls_timeout: the timeout for the language server
         :param trace_lsp_communication: whether to trace LSP communication
+        :param ls_specific_settings: optional LS specific configuration of the language server,
+            see docstrings in the inits of subclasses of SolidLanguageServer to see what values may be passed.
         :return: the language server
         """
         ls_config = LanguageServerConfig(
             code_language=self.language,
             ignored_paths=self._ignored_patterns,
             trace_lsp_communication=trace_lsp_communication,
+            encoding=self.project_config.encoding,
         )
         ls_logger = LanguageServerLogger(log_level=log_level)
 
@@ -288,5 +373,9 @@ class Project:
             ls_logger,
             self.project_root,
             timeout=ls_timeout,
-            solidlsp_settings=SolidLSPSettings(solidlsp_dir=SERENA_MANAGED_DIR_IN_HOME),
+            solidlsp_settings=SolidLSPSettings(
+                solidlsp_dir=SERENA_MANAGED_DIR_IN_HOME,
+                project_data_relative_path=SERENA_MANAGED_DIR_NAME,
+                ls_specific_settings=ls_specific_settings or {},
+            ),
         )

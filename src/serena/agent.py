@@ -8,11 +8,9 @@ import platform
 import sys
 import threading
 import webbrowser
-from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import Logger
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, TypeVar
 
 from sensai.util import logging
@@ -22,11 +20,11 @@ from interprompt.jinja_template import JinjaTemplate
 from serena import serena_version
 from serena.analytics import RegisteredTokenCountEstimator, ToolUsageStats
 from serena.config.context_mode import RegisteredContext, SerenaAgentContext, SerenaAgentMode
-from serena.config.serena_config import SerenaConfig, ToolInclusionDefinition, ToolSet, get_serena_managed_in_project_dir
+from serena.config.serena_config import SerenaConfig, ToolInclusionDefinition, ToolSet
 from serena.dashboard import SerenaDashboardAPI
 from serena.project import Project
 from serena.prompt_factory import SerenaPromptFactory
-from serena.tools import ActivateProjectTool, Tool, ToolMarker, ToolRegistry
+from serena.tools import ActivateProjectTool, GetCurrentConfigTool, Tool, ToolMarker, ToolRegistry
 from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
 from solidlsp import SolidLanguageServer
@@ -42,55 +40,6 @@ SUCCESS_RESULT = "OK"
 
 class ProjectNotFoundError(Exception):
     pass
-
-
-class LinesRead:
-    def __init__(self) -> None:
-        self.files: dict[str, set[tuple[int, int]]] = defaultdict(lambda: set())
-
-    def add_lines_read(self, relative_path: str, lines: tuple[int, int]) -> None:
-        self.files[relative_path].add(lines)
-
-    def were_lines_read(self, relative_path: str, lines: tuple[int, int]) -> bool:
-        lines_read_in_file = self.files[relative_path]
-        return lines in lines_read_in_file
-
-    def invalidate_lines_read(self, relative_path: str) -> None:
-        if relative_path in self.files:
-            del self.files[relative_path]
-
-
-class MemoriesManager:
-    def __init__(self, project_root: str):
-        self._memory_dir = Path(get_serena_managed_in_project_dir(project_root)) / "memories"
-        self._memory_dir.mkdir(parents=True, exist_ok=True)
-
-    def _get_memory_file_path(self, name: str) -> Path:
-        # strip all .md from the name. Models tend to get confused, sometimes passing the .md extension and sometimes not.
-        name = name.replace(".md", "")
-        filename = f"{name}.md"
-        return self._memory_dir / filename
-
-    def load_memory(self, name: str) -> str:
-        memory_file_path = self._get_memory_file_path(name)
-        if not memory_file_path.exists():
-            return f"Memory file {name} not found, consider creating it with the `write_memory` tool if you need it."
-        with open(memory_file_path, encoding="utf-8") as f:
-            return f.read()
-
-    def save_memory(self, name: str, content: str) -> str:
-        memory_file_path = self._get_memory_file_path(name)
-        with open(memory_file_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Memory {name} written."
-
-    def list_memories(self) -> list[str]:
-        return [f.name.replace(".md", "") for f in self._memory_dir.iterdir() if f.is_file()]
-
-    def delete_memory(self, name: str) -> str:
-        memory_file_path = self._get_memory_file_path(name)
-        memory_file_path.unlink()
-        return f"Memory {name} deleted."
 
 
 class AvailableTools:
@@ -134,6 +83,10 @@ class SerenaAgent:
         """
         # obtain serena configuration using the decoupled factory function
         self.serena_config = serena_config or SerenaConfig.from_config_file()
+
+        # project-specific instances, which will be initialized upon project activation
+        self._active_project: Project | None = None
+        self.language_server: SolidLanguageServer | None = None
 
         # adjust log level
         serena_log_level = self.serena_config.log_level
@@ -183,7 +136,7 @@ class SerenaAgent:
         # start the dashboard (web frontend), registering its log handler
         if self.serena_config.web_dashboard:
             self._dashboard_thread, port = SerenaDashboardAPI(
-                get_memory_log_handler(), tool_names, tool_usage_stats=self._tool_usage_stats
+                get_memory_log_handler(), tool_names, agent=self, tool_usage_stats=self._tool_usage_stats
             ).run_in_thread()
             dashboard_url = f"http://127.0.0.1:{port}/dashboard/index.html"
             log.info("Serena web dashboard started at %s", dashboard_url)
@@ -206,7 +159,7 @@ class SerenaAgent:
         # limited by the Serena config, the context (which is fixed for the session) and JetBrains mode
         tool_inclusion_definitions: list[ToolInclusionDefinition] = [self.serena_config, self._context]
         if self._context.name == RegisteredContext.IDE_ASSISTANT.value:
-            tool_inclusion_definitions.extend(self._ide_context_tool_inclusion_definitions(project))
+            tool_inclusion_definitions.extend(self._ide_assistant_context_tool_inclusion_definitions(project))
         if self.serena_config.jetbrains:
             tool_inclusion_definitions.append(SerenaAgentMode.from_name_internal("jetbrains"))
 
@@ -223,13 +176,6 @@ class SerenaAgent:
         # Initialize the prompt factory
         self.prompt_factory = SerenaPromptFactory()
         self._project_activation_callback = project_activation_callback
-
-        # project-specific instances, which will be initialized upon project activation
-        self._active_project: Project | None = None
-        self._active_project_root: str | None = None
-        self.language_server: SolidLanguageServer | None = None
-        self.memories_manager: MemoriesManager | None = None
-        self.lines_read: LinesRead | None = None
 
         # set the active modes
         if modes is None:
@@ -262,11 +208,12 @@ class SerenaAgent:
                 os.environ["COMSPEC"] = ""  # force use of default shell
                 log.info("Adjusting COMSPEC environment variable to use the default shell instead of '%s'", comspec)
 
-    def _ide_context_tool_inclusion_definitions(self, project_root_or_name: str | None) -> list[ToolInclusionDefinition]:
+    def _ide_assistant_context_tool_inclusion_definitions(self, project_root_or_name: str | None) -> list[ToolInclusionDefinition]:
         """
         In the IDE assistant context, the agent is assumed to work on a single project, and we thus
         want to apply that project's tool exclusions/inclusions from the get-go, limiting the set
         of tools that will be exposed to the client.
+        Furthermore, we disable tools that are only relevant for project activation.
         So if the project exists, we apply all the aforementioned exclusions.
 
         :param project_root_or_name: the project root path or project name
@@ -279,7 +226,11 @@ class SerenaAgent:
             #   and provide responses to the client immediately.
             project = self.load_project_from_path_or_name(project_root_or_name, autogenerate=False)
             if project is not None:
-                tool_inclusion_definitions.append(ToolInclusionDefinition(excluded_tools=[ActivateProjectTool.get_name_from_cls()]))
+                tool_inclusion_definitions.append(
+                    ToolInclusionDefinition(
+                        excluded_tools=[ActivateProjectTool.get_name_from_cls(), GetCurrentConfigTool.get_name_from_cls()]
+                    )
+                )
                 tool_inclusion_definitions.append(project.project_config)
         return tool_inclusion_definitions
 
@@ -373,6 +324,11 @@ class SerenaAgent:
             available_tools=self._exposed_tools.tool_names,
             available_markers=available_markers,
         )
+
+        # If a project is active at startup, append its activation message
+        if self._active_project is not None:
+            system_prompt += "\n\n" + self._active_project.get_activation_message()
+
         log.info("System prompt:\n%s", system_prompt)
         return system_prompt
 
@@ -437,10 +393,6 @@ class SerenaAgent:
         log.info(f"Activating {project.project_name} at {project.project_root}")
         self._active_project = project
         self._update_active_tools()
-
-        # initialize project-specific instances which do not depend on the language server
-        self.memories_manager = MemoriesManager(project.project_root)
-        self.lines_read = LinesRead()
 
         def init_language_server() -> None:
             # start the language server
@@ -585,6 +537,7 @@ class SerenaAgent:
             log_level=self.serena_config.log_level,
             ls_timeout=ls_timeout,
             trace_lsp_communication=self.serena_config.trace_lsp_communication,
+            ls_specific_settings=self.serena_config.ls_specific_settings,
         )
         log.info(f"Starting the language server for {self._active_project.project_name}")
         self.language_server.start()
@@ -598,10 +551,6 @@ class SerenaAgent:
 
     def print_tool_overview(self) -> None:
         ToolRegistry().print_tool_overview(self._active_tools.values())
-
-    def mark_file_modified(self, relative_path: str) -> None:
-        assert self.lines_read is not None
-        self.lines_read.invalidate_lines_read(relative_path)
 
     def __del__(self) -> None:
         """

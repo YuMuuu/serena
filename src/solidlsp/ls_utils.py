@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import uuid
+import zipfile
 from enum import Enum
 from pathlib import Path, PurePath
 
@@ -164,7 +165,7 @@ class FileUtils:
     """
 
     @staticmethod
-    def read_file(logger: LanguageServerLogger, file_path: str) -> str:
+    def read_file(logger: LanguageServerLogger, file_path: str, encoding: str) -> str:
         """
         Reads the file at the given path and returns the contents as a string.
         """
@@ -172,10 +173,10 @@ class FileUtils:
             logger.log(f"File read '{file_path}' failed: File does not exist.", logging.ERROR)
             raise SolidLSPException(f"File read '{file_path}' failed: File does not exist.")
         try:
-            with open(file_path, encoding="utf-8") as inp_file:
+            with open(file_path, encoding=encoding) as inp_file:
                 return inp_file.read()
         except Exception as exc:
-            logger.log(f"File read '{file_path}' failed to read with encoding 'utf-8': {exc}", logging.ERROR)
+            logger.log(f"File read '{file_path}' failed to read with encoding '{encoding}': {exc}", logging.ERROR)
             raise SolidLSPException("File read failed.") from None
 
     @staticmethod
@@ -206,9 +207,22 @@ class FileUtils:
             tmp_files.append(tmp_file_name)
             os.makedirs(os.path.dirname(tmp_file_name), exist_ok=True)
             FileUtils.download_file(logger, url, tmp_file_name)
-            if archive_type in ["zip", "tar", "gztar", "bztar", "xztar"]:
+            if archive_type in ["tar", "gztar", "bztar", "xztar"]:
                 os.makedirs(target_path, exist_ok=True)
                 shutil.unpack_archive(tmp_file_name, target_path, archive_type)
+            elif archive_type == "zip":
+                os.makedirs(target_path, exist_ok=True)
+                with zipfile.ZipFile(tmp_file_name, "r") as zip_ref:
+                    for zip_info in zip_ref.infolist():
+                        extracted_path = zip_ref.extract(zip_info, target_path)
+                        ZIP_SYSTEM_UNIX = 3  # zip file created on Unix system
+                        if zip_info.create_system != ZIP_SYSTEM_UNIX:
+                            continue
+                        # extractall() does not preserve permissions
+                        # see. https://github.com/python/cpython/issues/59999
+                        attrs = (zip_info.external_attr >> 16) & 0o777
+                        if attrs:
+                            os.chmod(extracted_path, attrs)
             elif archive_type == "zip.gz":
                 os.makedirs(target_path, exist_ok=True)
                 tmp_file_name_ungzipped = tmp_file_name + ".zip"
@@ -219,6 +233,9 @@ class FileUtils:
             elif archive_type == "gz":
                 with gzip.open(tmp_file_name, "rb") as f_in, open(target_path, "wb") as f_out:
                     shutil.copyfileobj(f_in, f_out)
+            elif archive_type == "binary":
+                # For single binary files, just move to target without extraction
+                shutil.move(tmp_file_name, target_path)
             else:
                 logger.log(f"Unknown archive type '{archive_type}' for extraction", logging.ERROR)
                 raise SolidLSPException(f"Unknown archive type '{archive_type}'")
@@ -281,7 +298,15 @@ class PlatformUtils:
         if system == "Windows" and machine == "":
             machine = cls._determine_windows_machine_type()
         system_map = {"Windows": "win", "Darwin": "osx", "Linux": "linux"}
-        machine_map = {"AMD64": "x64", "x86_64": "x64", "i386": "x86", "i686": "x86", "aarch64": "arm64", "arm64": "arm64"}
+        machine_map = {
+            "AMD64": "x64",
+            "x86_64": "x64",
+            "i386": "x86",
+            "i686": "x86",
+            "aarch64": "arm64",
+            "arm64": "arm64",
+            "ARM64": "arm64",
+        }
         if system in system_map and machine in machine_map:
             platform_id = system_map[system] + "-" + machine_map[machine]
             if system == "Linux" and bitness == "64bit":
